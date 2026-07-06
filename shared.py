@@ -4,7 +4,7 @@ import threading
 import collections
 
 # ── VLESS Relay State ──
-RELAY_BUF = 32768
+RELAY_BUF = 256 * 1024   # 256 KB buffer
 connections: dict = {}
 sub_clients: dict = {}
 TIMEOUT = 30

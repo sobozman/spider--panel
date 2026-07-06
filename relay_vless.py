@@ -1,6 +1,6 @@
 # relay_vless.py
-# Ø¨Ø®Ø´ VLESS Relay â€” Ø¬Ø¯Ø§ Ø´Ø¯Ù‡ Ø§Ø² main.py (Ù…Ù†Ø·Ù‚ Ø§ØµÙ„ÛŒ Ø¯Ø³Øªâ€ŒÙ†Ø®ÙˆØ±Ø¯Ù‡)
-# ØªØºÛŒÛŒØ±: Ø«Ø¨Øª IP ÙˆØ§Ù‚Ø¹ÛŒ Ú©Ù„Ø§ÛŒÙ†Øª (Ø¨Ø§ Ø§Ø­ØªØ³Ø§Ø¨ Ù‡Ø¯Ø± x-forwarded-for Ù¾Ø´Øª Ù¾Ø±Ø§Ú©Ø³ÛŒ) Ø¯Ø± connections
+# بخش VLESS Relay — جدا شده از main.py
+# از _get_main() برای دسترسی به main.LINKS استفاده می‌کند (جلوگیری از circular import)
 
 import asyncio
 import secrets
@@ -9,9 +9,8 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+# ── Shared state (used directly; main.py populates these) ──
 from shared import (
-    LINKS,
-    LINKS_LOCK,
     stats,
     hourly_traffic,
     connections,
@@ -22,31 +21,20 @@ from shared import (
 logger = logging.getLogger("Spider-Gateway")
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
-# Lazy imports for functions from main.py (circular import fix)
+# ── Lazy access to main module (avoids circular import) ──
 _main = None
+
 def _get_main():
     global _main
     if _main is None:
         import main as _main
     return _main
 
-def __now_ir():
-    return datetime.now(IRAN_TZ)
+# ══════════════════════════════════════════════════════════════════════════════
+# VLESS Relay — بهینه‌شده برای حداکثر throughput
+# ══════════════════════════════════════════════════════════════════════════════
 
-def __is_link_allowed(link):
-    return _get_main().is_link_allowed(link)
-
-def __save_state():
-    return _get_main().save_state()
-
-def __log_activity(*args, **kwargs):
-    return _get_main().log_activity(*args, **kwargs)
-
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# VLESS Relay â€” Ø¨Ù‡ÛŒÙ†Ù‡â€ŒØ´Ø¯Ù‡ Ø¨Ø±Ø§ÛŒ Ø­Ø¯Ø§Ú©Ø«Ø± throughput
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-RELAY_BUF = 256 * 1024   # 256 KB buffer
+RELAY_BUF_LOCAL = 256 * 1024
 
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
@@ -55,7 +43,7 @@ def _ws_client_ip(ws: WebSocket) -> str:
     real_ip = ws.headers.get("x-real-ip")
     if real_ip:
         return real_ip.strip()
-    return ws.client.host if ws.client else "Ù†Ø§Ù…Ø´Ø®Øµ"
+    return ws.client.host if ws.client else "نامشخص"
 
 async def parse_vless_header(chunk: bytes):
     if len(chunk) < 24:
@@ -88,30 +76,28 @@ async def check_and_use(uid: str, n: int) -> bool:
             return False
         link["used_bytes"] += n
         stats["total_bytes"] += n
-        hourly_traffic[_now_ir().strftime("%H:00")] += n
+        hourly_traffic[m.now_ir().strftime("%H:00")] += n
     return True
 
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
     try:
         while True:
-            msg = await asyncio.wait_for(ws.receive(), timeout=120.0)
+            msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
             if not await check_and_use(uid, len(data)):
-                await ws.close(code=1008, reason="quota/disabled")
+                await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             stats["total_requests"] += 1
             connections[conn_id]["bytes"] += len(data)
             writer.write(data)
-            if writer.transport.get_write_buffer_size() > RELAY_BUF:
+            if writer.transport.get_write_buffer_size() > RELAY_BUF_LOCAL:
                 await writer.drain()
-    except asyncio.TimeoutError:
-        logger.debug(f"WS recv timeout [{conn_id}]")
-    except (WebSocketDisconnect, Exception) as exc:
-        logger.debug(f"WS->TCP end [{conn_id}]: {exc}")
+    except (WebSocketDisconnect, Exception):
+        pass
     finally:
         try:
             writer.write_eof()
@@ -122,23 +108,20 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
     first = True
     try:
         while True:
-            data = await asyncio.wait_for(reader.read(RELAY_BUF), timeout=120.0)
+            data = await reader.read(RELAY_BUF_LOCAL)
             if not data:
                 break
             if not await check_and_use(uid, len(data)):
-                await ws.close(code=1008, reason="quota/disabled")
+                await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             connections[conn_id]["bytes"] += len(data)
             payload = (b"\x00\x00" + data) if first else data
             first = False
             await ws.send_bytes(payload)
-    except asyncio.TimeoutError:
-        logger.debug(f"TCP recv timeout [{conn_id}]")
-    except Exception as exc:
-        logger.debug(f"TCP->WS end [{conn_id}]: {exc}")
+    except Exception:
+        pass
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
-    logger.debug(f"websocket_tunnel: accepting /ws/… for uuid={uuid[:8]}…")
     await ws.accept()
     m = _get_main()
 
@@ -150,8 +133,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         await ws.close(code=1008, reason="not authorized")
         return
 
-    logger.info(f"WS accepted uuid={uuid[:8]}… link={link.get('label','?')}")
-
     ip = _ws_client_ip(ws)
     conn_id = secrets.token_urlsafe(6)
     connections[conn_id] = {
@@ -161,8 +142,8 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         "connected_at": datetime.now().isoformat(),
         "bytes": 0,
     }
-    logger.info(f"âœ… WS [{conn_id}] uuid={uuid[:8]}â€¦ ip={ip} total={len(connections)}")
-    __log_activity("connection", f"Ø§ØªØµØ§Ù„ Ø¬Ø¯ÛŒØ¯ Ø§Ø² {ip} (Ú©Ø§Ù†ÙÛŒÚ¯ {link.get('label','?')})", "info")
+    logger.info(f"WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
+    m.log_activity("connection", f"اتصال جدید از {ip} (کانفیگ {link.get('label','?')})", "info")
     writer = None
 
     try:
@@ -181,7 +162,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"âž¡ï¸  [{conn_id}] â†’ {address}:{port}")
+        logger.info(f"[{conn_id}] → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
@@ -196,7 +177,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             writer.write(payload)
             await writer.drain()
 
-        # Run bi-directional relay
         done, pending = await asyncio.wait(
             {
                 asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id, uuid)),
@@ -211,7 +191,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(__save_state())
+        asyncio.create_task(m.save_state())
 
     except WebSocketDisconnect:
         pass
@@ -230,4 +210,4 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except Exception:
                 pass
         connections.pop(conn_id, None)
-        logger.info(f"ðŸ”Œ WS closed [{conn_id}] total={len(connections)}")
+        logger.info(f"WS closed [{conn_id}] total={len(connections)}")

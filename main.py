@@ -585,12 +585,10 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None) -> st
             extra = quote('{"xPaddingBytes":"100-1000","mode":"auto","scMaxEachPostBytes":"1000000"}', safe='')
             params = f"encryption=none&security=tls&type=xhttp&host={quote(vless_host)}&path={quote(stored_path, safe='')}&sni={quote(sni)}&fp=chrome&alpn=h2,http/1.1&mode=auto&extra={extra}"
             return f"vless://{config_uuid}@{vless_host}:{vless_port}?{params}#{remark}"
-        else:  # ws — prepend /ws/ prefix so client connects to /ws/{path}
+        else:  # ws — config_uuid IS the path (same as reference RVG-main)
             ws_host = (inbound.get("domain") if inbound else None) or SETTINGS.get("domain") or host
             ws_sni = sni if sni and sni != host else ws_host
-            # Normalize: strip any existing /ws/ or / prefix, then prepend /ws/
-            ws_path_raw = stored_path.strip("/").replace("ws/", "", 1) if stored_path.startswith("/ws/" if stored_path.startswith("/") else "ws/") else stored_path.strip("/")
-            ws_path = "/ws/" + ws_path_raw
+            ws_path = f"/ws/{config_uuid}"
             params = "&".join([
                 "encryption=none",
                 "security=tls",
@@ -1205,53 +1203,18 @@ try:
         relay_tcp_to_ws,
         websocket_tunnel,
     )
-    # WebSocket route: /ws/{path}
-    # Works for both old (/ws/{uuid}) and new (/ws/{random_path}) clients
-    # PATH_INDEX maps random_path -> config_uuid for resolution
-    @app.websocket("/ws/{path:path}")
-    async def ws_resolver(ws: WebSocket, path: str):
-        clean = path.strip("/")
-        logger.info(f"WebSocket /ws/{clean} — resolving…")
-
-        # Special-case: /ws/live → live stats (registered later; caught here first)
-        if clean == "live":
-            logger.info(f"WebSocket /ws/live → delegating to live stats")
+    # WebSocket route: /ws/{uuid} — config_uuid IS the path
+    # Uses the same approach as reference RVG-main project
+    @app.websocket("/ws/{uuid}")
+    async def ws_uuid_handler(ws: WebSocket, uuid: str):
+        # /ws/live is registered later — handle it here since param route matches first
+        if uuid == "live":
             await websocket_live_stats(ws)
             return
+        await websocket_tunnel(ws, uuid)
 
-        # Try PATH_INDEX first (random path -> uuid)
-        async with PATH_INDEX_LOCK:
-            resolved = PATH_INDEX.get(clean)
-        if resolved:
-            logger.info(f"WebSocket /ws/{clean} → resolved via PATH_INDEX → uuid={resolved[:8]}…")
-            await websocket_tunnel(ws, resolved)
-            return
-
-        # Try as direct UUID (legacy clients using /ws/{uuid})
-        import re
-        if re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', clean, re.I):
-            logger.info(f"WebSocket /ws/{clean} → resolved as UUID (legacy)")
-            await websocket_tunnel(ws, clean)
-            return
-        if re.match(r'^[0-9a-f]{8,64}$', clean, re.I):
-            logger.info(f"WebSocket /ws/{clean} → resolved as hex UUID")
-            await websocket_tunnel(ws, clean)
-            return
-
-        # Also try stripping ws/ prefix (belt-and-suspenders)
-        resolved2 = PATH_INDEX.get(clean.lstrip("ws/"))
-        if resolved2:
-            logger.info(f"WebSocket /ws/{clean} → resolved via prefix-strip")
-            await websocket_tunnel(ws, resolved2)
-            return
-
-        # ── Unknown path: MUST accept before close, or client sees Status=0 ──
-        logger.warning(f"WebSocket rejected: unknown path /ws/{clean}")
-        await ws.accept()
-        await ws.close(code=1008, reason="unknown path")
-
-    logger.info("VLESS Relay module loaded (WS: /ws/{path})")
-except (ImportError, ModuleNotFoundError) as e:
+    logger.info("VLESS Relay module loaded (WS: /ws/{uuid})")
+except Exception as e:
     logger.warning(f"VLESS Relay module not available: {e}")
 
 # XHTTP — optional transport module
@@ -1561,7 +1524,7 @@ async def create_user(request: Request, _=Depends(require_auth)):
             "config_uuid": config_uuid,
             "subscription_uuid": subscription_uuid,
             "sni": sni,
-            "path": path_custom if path_custom else generate_random_path(),
+            "path": path_custom if path_custom else f"/ws/{config_uuid}",
             "transport_type": transport_type,
             "inbound_id": inbound_id,
         }
@@ -1583,11 +1546,11 @@ async def create_user(request: Request, _=Depends(require_auth)):
             "path": _path,
             "user_id": user_id,
         }
-        # Register path in PATH_INDEX for WebSocket resolution
-        if _path:
-            PATH_INDEX[_path] = config_uuid
-        # Also index by config_uuid for backward compat
+        # Register uuid in PATH_INDEX for backward compat (old random-path clients)
+        # config_uuid IS the path under /ws/{config_uuid}
         PATH_INDEX[config_uuid] = config_uuid
+        if _path:
+            PATH_INDEX[_path.lstrip("/")] = config_uuid
 
     asyncio.create_task(save_state())
     log_activity("user", f"کاربر «{username}» با پروتکل {protocol} ساخته شد", "ok")
