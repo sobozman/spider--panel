@@ -715,6 +715,13 @@ tr{animation:fadeIn .3s ease}
   </div>
 </div></div>
 
+<!-- QR MODAL -->
+<div class="modal" id="mod-qr"><div class="modal-c" style="max-width:340px;text-align:center">
+  <div class="modal-t"><span class="glow">QR Code</span></div>
+  <img id="qr-img" src="" style="width:260px;height:260px;background:#fff;border-radius:12px;margin:12px auto;display:block" alt="QR">
+  <button class="btn btn-g" onclick="closeModal('mod-qr')" style="width:100%">بستن</button>
+</div></div>
+
 <!-- TOAST -->
 <div class="toast" id="toast"></div>
 
@@ -1005,6 +1012,7 @@ function renderUsers() {
     html += '<td><div class="act-row">';
     html += '<button class="btn btn-sm btn-g" onclick="viewCfg(\'' + u.user_id + '\')" title="مشاهده کانفیگ">⚙️</button>';
     html += '<button class="btn btn-sm btn-g" onclick="viewSub(\'' + u.username + '\')" title="لینک اشتراک">🔗</button>';
+    html += '<button class="btn btn-sm btn-b" onclick="viewQR(\'' + u.user_id + '\')" title="QR Code">📱</button>';
     html += '<button class="btn btn-sm btn-b" onclick="editUser(\'' + u.user_id + '\')" title="ویرایش">✏️</button>';
     html += '<button class="btn btn-sm btn-r" onclick="toggleUser(\'' + u.user_id + '\')" title="فعال/غیرفعال">🔄</button>';
     html += '<button class="btn btn-sm btn-r" onclick="deleteUser(\'' + u.user_id + '\')" title="حذف">🗑️</button>';
@@ -1101,6 +1109,7 @@ function copyCfg() {
 }
 
 function viewSub(username) { window.open('/sub/' + username, '_blank'); }
+function viewQR(userId) { $id('qr-img').src = '/api/users/' + userId + '/qr?t=' + Date.now(); openModal('mod-qr'); }
 
 // ─── Inbounds ───
 async function loadInbounds() {
