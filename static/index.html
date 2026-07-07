@@ -589,6 +589,10 @@ tr{animation:fadeIn .3s ease}
       <div class="f-g"><label>واحد</label><select id="cu-exp-u"><option value="days">روز</option><option value="months">ماه</option></select></div>
     </div>
     <div class="f-g"><label>اتصال همزمان</label><input type="number" id="cu-conn" value="2"></div>
+    <div class="f-r">
+      <div class="f-g"><label>پروتکل</label><select id="cu-proto"><option value="vless">VLESS</option><option value="vmess">VMess</option><option value="trojan">Trojan</option><option value="reality">Reality</option></select></div>
+      <div class="f-g"><label>انتقال</label><select id="cu-transport"><option value="ws">WebSocket</option><option value="xhttp">XHTTP</option><option value="tcp">TCP</option><option value="grpc">gRPC</option></select></div>
+    </div>
     <div class="f-g"><label>اینباند</label><select id="cu-inbound"><option value="">-- پیش‌فرض --</option></select></div>
     <div class="modal-btns">
       <button type="button" class="btn btn-g" onclick="closeModal('mod-user')">انصراف</button>
@@ -630,6 +634,7 @@ tr{animation:fadeIn .3s ease}
         <option value="vless">VLESS</option>
         <option value="vmess">VMess</option>
         <option value="trojan">Trojan</option>
+        <option value="reality">Reality</option>
       </select></div>
       <div class="f-g"><label>پورت</label><input type="number" id="ib-port" required placeholder="443"></div>
     </div>
@@ -1033,6 +1038,8 @@ function openCreateUser() {
   $id('cu-exp').value = '30';
   $id('cu-exp-u').value = 'days';
   $id('cu-conn').value = '2';
+  $id('cu-proto').value = 'vless';
+  $id('cu-transport').value = 'ws';
   openModal('mod-user');
 }
 
@@ -1047,6 +1054,8 @@ async function submitCreateUser(e) {
       traffic_limit_gb: vu === 'GB' ? v : v / 1024,
       expire_days: eu === 'months' ? ex * 30 : ex,
       concurrent_connections: parseInt($id('cu-conn').value) || 2,
+      protocol: $id('cu-proto').value || 'vless',
+      transport_type: $id('cu-transport').value || 'ws',
       inbound_id: $id('cu-inbound').value || null
     }});
     toast('کاربر ' + r.username + ' با موفقیت ایجاد شد', 'ok');
@@ -1158,48 +1167,16 @@ function populateInboundSelects() {
   if (sel) sel.innerHTML = opts;
 }
 
-function openCreateInbound() {
-  $id('ib-title').textContent = 'ایجاد اینباند جدید';
-  $id('ib-id').value = '';
-  $id('ib-name').value = '';
-  $id('ib-proto').value = 'vless';
-  $id('ib-port').value = '';
-  $id('ib-ext-port').value = '';
-  $id('ib-domain').value = '';
-  $id('ib-sni').value = '';
-  $id('ib-network').value = 'ws';
-  $id('ib-security').value = 'tls';
-  $id('ib-fingerprint').value = 'chrome';
-  $id('ib-submit').textContent = 'ایجاد اینباند';
-  onInboundProtoChange();
-  openModal('mod-inbound');
-}
-
-function editInbound(iid) {
-  var ib = ALL_IB.find(function(x) { return x.inbound_id === iid; });
-  if (!ib) return;
-  $id('ib-title').textContent = 'ویرایش اینباند';
-  $id('ib-id').value = iid;
-  $id('ib-name').value = ib.name || '';
-  $id('ib-proto').value = ib.protocol || 'vless';
-  $id('ib-port').value = ib.port || '';
-  $id('ib-ext-port').value = ib.external_port || '';
-  $id('ib-domain').value = ib.domain || '';
-  $id('ib-sni').value = ib.sni || '';
-  $id('ib-network').value = ib.network || 'ws';
-  $id('ib-security').value = ib.security || 'tls';
-  $id('ib-fingerprint').value = ib.fingerprint || 'chrome';
-  $id('ib-submit').textContent = 'بروزرسانی اینباند';
-  onInboundProtoChange();
-  openModal('mod-inbound');
-}
-
 function onInboundProtoChange() {
   var p = $id('ib-proto').value;
   var secWrap = $id('ib-sec-wrap');
   if (p === 'vless' || p === 'vmess' || p === 'trojan') {
     secWrap.classList.remove('hidden');
-    $id('ib-security').value = 'tls';
+    // Don't reset security if it's already 'reality'
+    if ($id('ib-security').value === 'none') $id('ib-security').value = 'tls';
+  } else if (p === 'reality') {
+    secWrap.classList.remove('hidden');
+    $id('ib-security').value = 'reality';
   } else {
     secWrap.classList.add('hidden');
   }
@@ -1209,7 +1186,12 @@ function onInboundProtoChange() {
 function onSecurityChange() {
   var sec = $id('ib-security').value;
   var tlsF = $id('ib-tls-fields'), realF = $id('ib-reality-fields');
-  if (sec === 'reality') { tlsF.classList.add('hidden'); realF.classList.remove('hidden'); }
+  if (sec === 'reality') {
+    tlsF.classList.add('hidden');
+    realF.classList.remove('hidden');
+    // Auto-set protocol to reality and show proper fields
+    $id('ib-proto').value = 'reality';
+  }
   else if (sec === 'tls') { tlsF.classList.remove('hidden'); realF.classList.add('hidden'); }
   else { tlsF.classList.add('hidden'); realF.classList.add('hidden'); }
 }
@@ -1301,14 +1283,14 @@ function editInbound(iid) {
   $id('ib-network').value = ib.network || 'tcp';
   $id('ib-fingerprint').value = ib.fingerprint || 'chrome';
   var rs = ib.reality_settings || {};
-  $id('ib-privkey').value = (rs || {}).private_key || ib.private_key || '';
-  $id('ib-pubkey').value = (rs || {}).public_key || ib.public_key || '';
-  $id('ib-shortids').value = (rs || {}).short_ids || '';
-  $id('ib-spiderx').value = (rs || {}).spiderx || '/';
+  $id('ib-privkey').value = rs.private_key || ib.private_key || '';
+  $id('ib-pubkey').value = rs.public_key || ib.public_key || '';
+  $id('ib-shortids').value = rs.short_id || rs.short_ids || '';
+  $id('ib-spiderx').value = rs.spiderx || '/';
   $id('ib-extdomain').value = ib.external_domain || '';
   $id('ib-extport').value = ib.external_port || '443';
-  $id('ib-dest').value = (rs || {}).dest || 'is1-ssl.mzstatic.com:443';
-  $id('ib-servernames').value = (rs || {}).server_names || (rs || {}).sni || 'is1-ssl.mzstatic.com';
+  $id('ib-dest').value = rs.dest || 'is1-ssl.mzstatic.com:443';
+  $id('ib-servernames').value = rs.server_names || rs.sni || 'is1-ssl.mzstatic.com';
   var ws = ib.ws_settings || {}; var xh = ib.xhttp_settings || {};
   $id('ib-wspath').value = ws.path || '/';
   $id('ib-xhttppath').value = xh.path || '/';
@@ -1332,6 +1314,12 @@ async function submitInbound(e) {
   var sni = $id('ib-sni').value || domain;
   var fp = $id('ib-fingerprint').value || 'chrome';
 
+  // Force protocol to 'reality' when security is 'reality'
+  if (security === 'reality') {
+    proto = 'reality';
+    $id('ib-proto').value = 'reality';
+  }
+
   var body = {
     name: $id('ib-name').value,
     protocol: proto,
@@ -1352,10 +1340,14 @@ async function submitInbound(e) {
       public_key: $id('ib-pubkey').value || '',
       dest: $id('ib-dest').value || 'is1-ssl.mzstatic.com:443',
       server_names: ($id('ib-servernames').value || '').split(',').map(function(s){return s.trim()}).filter(Boolean),
-      short_ids: $id('ib-shortids').value || '',
+      short_id: $id('ib-shortids').value || '',
       spiderx: $id('ib-spiderx').value || '/',
       fingerprint: fp
     };
+    // Reality defaults to xhttp if no network preference
+    if (network !== 'grpc' && network !== 'tcp' && network !== 'xhttp') {
+      body.network = 'tcp';
+    }
   }
 
   // Network settings
@@ -1364,7 +1356,9 @@ async function submitInbound(e) {
   } else if (network === 'xhttp') {
     body.xhttp_settings = {
       path: $id('ib-xhttppath').value || '/',
-      mode: $id('ib-xhttp-mode').value || 'auto'
+      mode: $id('ib-xhttp-mode').value || 'auto',
+      xPaddingBytes: '100-1000',
+      scMaxEachPostBytes: '1000000'
     };
   } else if (network === 'grpc') {
     body.grpc_settings = { serviceName: $id('ib-grpc-svc').value || 'grpc' };

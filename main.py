@@ -389,6 +389,10 @@ def generate_vless_link(uuid: str, host: str, remark: str = "Spider", protocol: 
         # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one
         mode = protocol.replace("xhttp-", "")  # packet-up | stream-up | stream-one
         path = f"/xhttp-siz10/{mode}/{uuid}"
+        xpad = "100-1000"
+        xsc = "1000000"
+        extra_raw = '{{"xPaddingBytes":"{}","mode":"{}","scMaxEachPostBytes":"{}"}}'.format(xpad, mode, xsc)
+        extra = quote(extra_raw, safe='')
         params = {
             "encryption": "none",
             "security": "tls",
@@ -399,6 +403,7 @@ def generate_vless_link(uuid: str, host: str, remark: str = "Spider", protocol: 
             "sni": host,
             "fp": "chrome",
             "alpn": "h2,http/1.1",
+            "extra": extra,
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
@@ -1087,6 +1092,14 @@ async def create_link(request: Request, _=Depends(require_auth)):
         protocol = DEFAULT_PROTOCOL
 
     uid = generate_uuid()
+    # Auto-set xhttp settings when using xhttp protocol
+    link_xhttp = {}
+    if protocol.startswith("xhttp-"):
+        link_xhttp = {
+            "xPaddingBytes": "100-1000",
+            "mode": protocol.replace("xhttp-", ""),
+            "scMaxEachPostBytes": "1000000",
+        }
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
@@ -1099,6 +1112,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "is_default": False,
             "sub_id": sub_id,
             "protocol": protocol,
+            "xhttp_settings": link_xhttp,
         }
 
     if sub_id:
@@ -1154,6 +1168,17 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             link["label"] = str(body["label"])[:60]
         if "note" in body:
             link["note"] = str(body["note"])[:200]
+        if "protocol" in body:
+            p = str(body["protocol"])
+            if p in PROTOCOLS:
+                link["protocol"] = p
+                # Auto-set xhttp defaults when switching to xhttp protocol
+                if p.startswith("xhttp-"):
+                    link["xhttp_settings"] = {
+                        "xPaddingBytes": "100-1000",
+                        "mode": p.replace("xhttp-", ""),
+                        "scMaxEachPostBytes": "1000000",
+                    }
         if "reset_usage" in body and body["reset_usage"]:
             link["used_bytes"] = 0
             log_activity("link", f"مصرف کانفیگ «{label}» ریست شد", "info")
@@ -1299,6 +1324,9 @@ async def create_inbound(request: Request, _=Depends(require_auth)):
     external_port = int(body.get("external_port") or 443)
     fingerprint = str(body.get("fingerprint") or "chrome").strip()
     reality_settings = body.get("reality_settings", {}) if isinstance(body.get("reality_settings"), dict) else {}
+    # Normalize: accept short_ids (frontend sends this) → map to short_id
+    if "short_ids" in reality_settings and "short_id" not in reality_settings:
+        reality_settings["short_id"] = reality_settings.pop("short_ids")
     xhttp_settings = body.get("xhttp_settings", {}) if isinstance(body.get("xhttp_settings"), dict) else {}
     ws_settings = body.get("ws_settings", {}) if isinstance(body.get("ws_settings"), dict) else {}
     grpc_settings = body.get("grpc_settings", {}) if isinstance(body.get("grpc_settings"), dict) else {}
@@ -1380,9 +1408,10 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
             ib["network"] = str(body["network"]).lower()
         if "security" in body:
             ib["security"] = str(body["security"]).lower()
-        # Reality protocol must always use security="reality"
-        if ib.get("protocol") == "reality":
+        # Reality protocol must always use security="reality" (and vice-versa)
+        if ib.get("protocol") == "reality" or ib.get("security") == "reality":
             ib["security"] = "reality"
+            ib["protocol"] = "reality"
             # Auto-update reality_settings with short_id/spiderx if not present
             rs = ib.setdefault("reality_settings", {})
             if not rs.get("short_id"):
@@ -1402,7 +1431,12 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
         if "fingerprint" in body:
             ib["fingerprint"] = str(body["fingerprint"]).strip()
         if "reality_settings" in body and isinstance(body["reality_settings"], dict):
-            ib["reality_settings"] = body["reality_settings"]
+            # Normalize: accept short_ids (frontend sends this) and map to short_id
+            rs = dict(body["reality_settings"])
+            if "short_ids" in rs and "short_id" not in rs:
+                rs["short_id"] = rs.pop("short_ids")
+            # Merge instead of replace — preserve existing settings not in body
+            ib["reality_settings"].update(rs)
         if "xhttp_settings" in body and isinstance(body["xhttp_settings"], dict):
             ib["xhttp_settings"] = body["xhttp_settings"]
         if "ws_settings" in body and isinstance(body["ws_settings"], dict):
@@ -1699,60 +1733,6 @@ async def reset_user_traffic(user_id: str, _=Depends(require_auth)):
     return {"ok": True, "user_id": user_id, "traffic_used_bytes": 0}
 
 @app.delete("/api/users/{user_id}")
-@app.patch("/api/users/{user_id}")
-async def edit_user(user_id: str, request: Request, _=Depends(require_auth)):
-    """Edit an existing user."""
-    body = await request.json()
-    async with USERS_LOCK:
-        if user_id not in USERS:
-            raise HTTPException(status_code=404, detail="user not found")
-        u = USERS[user_id]
-        if "username" in body:
-            u["username"] = str(body["username"]).strip()[:40]
-        if "traffic_limit_gb" in body:
-            gb = float(body["traffic_limit_gb"])
-            u["traffic_limit_bytes"] = int(gb * 1024**3) if gb > 0 else 0
-        if "expire_days" in body:
-            days = int(body["expire_days"])
-            u["expire_at"] = (datetime.now() + timedelta(days=days)).isoformat() if days > 0 else None
-        if "protocol" in body:
-            p = str(body["protocol"]).lower()
-            if p in USER_PROTOCOLS:
-                u["protocol"] = p
-        if "status" in body:
-            u["status"] = str(body["status"])
-        if "sni" in body:
-            u["sni"] = str(body["sni"]).strip()
-        if "path" in body:
-            # Update PATH_INDEX when path changes
-            old_path = (u.get("path") or "").strip().lstrip("/")
-            new_path = str(body["path"]).strip().lstrip("/")
-            u["path"] = new_path
-            if old_path:
-                PATH_INDEX.pop(old_path, None)
-            if new_path:
-                PATH_INDEX[new_path] = u.get("config_uuid", user_id)
-        if "transport_type" in body:
-            u["transport_type"] = str(body["transport_type"]).strip().lower()
-        if "concurrent_connections" in body:
-            u["concurrent_connections"] = max(1, int(body["concurrent_connections"]))
-        if "reset_traffic" in body and body["reset_traffic"]:
-            u["traffic_used_bytes"] = 0
-    asyncio.create_task(save_state())
-    return {"ok": True, "user_id": user_id}
-
-@app.get("/api/users/{user_id}")
-async def get_user(user_id: str, _=Depends(require_auth)):
-    """Get single user details."""
-    async with USERS_LOCK:
-        if user_id not in USERS:
-            raise HTTPException(status_code=404, detail="user not found")
-        u = dict(USERS[user_id])
-        u["user_id"] = user_id
-        u["password_hash"] = None
-        return u
-
-
 async def delete_user(user_id: str, _=Depends(require_auth)):
     """Delete a user permanently."""
     async with USERS_LOCK:
@@ -1771,10 +1751,30 @@ async def delete_user(user_id: str, _=Depends(require_auth)):
     # Delete matching link
     if config_uuid:
         async with LINKS_LOCK:
-            LINKS.pop(config_uuid, None)
+            link = LINKS.pop(config_uuid, None)
+            # Also remove from any SUB it belonged to
+            if link and link.get("sub_id"):
+                async with SUBS_LOCK:
+                    sub = SUBS.get(link["sub_id"])
+                    if sub:
+                        ids = sub.get("link_ids", [])
+                        if config_uuid in ids:
+                            ids.remove(config_uuid)
     asyncio.create_task(save_state())
     log_activity("user", f"کاربر «{username}» حذف شد", "err")
     return {"ok": True, "deleted": user_id}
+
+@app.get("/api/users/{user_id}")
+async def get_user(user_id: str, _=Depends(require_auth)):
+    """Get single user details."""
+    async with USERS_LOCK:
+        if user_id not in USERS:
+            raise HTTPException(status_code=404, detail="user not found")
+        u = dict(USERS[user_id])
+        u["user_id"] = user_id
+        u["password_hash"] = None
+        return u
+
 
 @app.get("/api/users/{user_id}")
 async def get_single_user(user_id: str, _=Depends(require_auth)):
@@ -1810,7 +1810,6 @@ async def edit_user(user_id: str, request: Request, _=Depends(require_auth)):
 
         if "username" in body:
             new_name = str(body["username"]).strip()[:40]
-            # Check duplicate
             for oid, ou in USERS.items():
                 if oid != user_id and ou.get("username") == new_name:
                     raise HTTPException(status_code=409, detail="Username already exists")
@@ -1849,6 +1848,33 @@ async def edit_user(user_id: str, request: Request, _=Depends(require_auth)):
         if "concurrent_connections" in body:
             cc = int(body["concurrent_connections"] or 3)
             u["concurrent_connections"] = max(1, cc)
+
+        if "reset_traffic" in body and body["reset_traffic"]:
+            u["traffic_used_bytes"] = 0
+
+    # Also sync link if exists
+    config_uuid = u.get("config_uuid")
+    if config_uuid:
+        async with LINKS_LOCK:
+            link = LINKS.get(config_uuid)
+            if link:
+                if "username" in body:
+                    link["label"] = u["username"]
+                if "traffic_limit_gb" in body:
+                    link["limit_bytes"] = u["traffic_limit_bytes"]
+                if "expire_days" in body:
+                    link["expires_at"] = u["expire_at"]
+                if "status" in body:
+                    link["active"] = (u["status"] == "active")
+                if "transport_type" in body:
+                    link["transport_type"] = u["transport_type"]
+                    # Auto-set xhttp_settings when switching to xhttp
+                    if u["transport_type"] == "xhttp":
+                        link["xhttp_settings"] = {
+                            "xPaddingBytes": "100-1000",
+                            "mode": "auto",
+                            "scMaxEachPostBytes": "1000000",
+                        }
 
     asyncio.create_task(save_state())
     log_activity("user", f"کاربر «{old_username}» ویرایش شد", "info")
